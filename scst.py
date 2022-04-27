@@ -1,16 +1,7 @@
 import pytorch_lightning as pl
 import torch
-from utils import save_json, compute_mean
 import torch.nn.functional as F
 from transformers import (
-    MaxLengthCriteria,
-    NoRepeatNGramLogitsProcessor,
-    RepetitionPenaltyLogitsProcessor,
-    LogitsProcessorList,
-    StoppingCriteriaList,
-    TemperatureLogitsWarper,
-    TopKLogitsWarper,
-    TopPLogitsWarper,
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
     AutoConfig,
@@ -24,14 +15,21 @@ from hf_data import create_data
 import os
 from typing import Tuple, Dict
 from scoring import combine_rewards
-from utils import create_weight_vector
 from collections import OrderedDict
+from dataclasses import dataclass
+from typing import List
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class RLTrainer(pl.LightningModule):
-    def __init__(self, model_cfg, node_cfg, generate_cfg, ul_config, reward_list):
+    def __init__(self, model_cfg :dataclass, node_cfg: dataclass, generate_cfg:dataclass, reward_list:List[str]):
+        """Args:
+        model_cfg : The model configurations can be found in constants.py
+        node_cfg: The node(GPU node) params and can be found in constants.py
+        generate_cfg: The parameters used for generation of text and further information can be found in constants.py file.
+        reward_list : A list of rewards.
+        """
         super().__init__()
         self.model_cfg = model_cfg
         self.generate_cfg = generate_cfg
@@ -49,39 +47,8 @@ class RLTrainer(pl.LightningModule):
         self.no_copy_ngram = self.generate_cfg.no_copy_ngram
         self.no_repeat_ngram = self.generate_cfg.no_repeat_ngram
         self.val_rouge, self.test_results = None, None
-        self.ul_config = ul_config
-        self.ul_weights = (
-            self.init_ul_weights() if self.ul_config.use_ul is True else None
-        )
         self.reward_list = reward_list
         self.are_weights_on_device = False
-
-    def init_ul_weights(self) -> torch.Tensor:
-        tokens = set([int(i) for i in self.ul_config.exclude_tokens.split(",")])
-        ids, weights = create_weight_vector(
-            fname=self.ul_config.ul_file_path,
-            num_weights=self.ul_config.ul_n_weights,
-            exclude_tokens=tokens,
-        )
-        if self.ul_config.ul_softmax:
-            weights = torch.nn.functional.softmax(
-                weights / self.ul_config.ul_temprature, dim=-1
-            )
-        weight_vector = torch.zeros(self.config.vocab_size).float()
-        for i in range(len(ids)):
-            weight_vector[ids[i]] = weights[i]
-
-        return weight_vector
-
-    @property
-    def decoder_start_id(self) -> int:
-        """Property to get decoder start id."""
-        return self.model.config.decoder_start_token_id
-
-    @property
-    def eos_token_id(self) -> int:
-        """property to get eos token id."""
-        return self.model.config.eos_token_id
 
     @property
     def get_encoder(self):
@@ -90,100 +57,9 @@ class RLTrainer(pl.LightningModule):
 
     @staticmethod
     def _update_past(past, new_past) -> Dict:
-
+        """Update past key values for encoder."""
         past["past"] = new_past
         return past
-
-    def unlikelihood_loss(
-        self, decoder_input_ids, logits, weight_mask, selective_penalty=False
-    ):
-        probs = F.softmax(logits, dim=-1)
-        neg_probs = 1 - probs
-
-        # replace zeros with small positive constant for stability
-        neg_probs += (neg_probs == 0).float() * 1e-8
-        log_neg_probs = torch.log(neg_probs)  # (N,s,v)
-
-        # now create attention mask and apply it
-        attention_mask = decoder_input_ids.eq(1).eq(0).float()
-        attention_mask = attention_mask.unsqueeze(2).expand(-1, -1, logits.shape[2])
-        log_neg_probs_masked = log_neg_probs * attention_mask
-
-        # apply weight vector to the log probability tensor
-        N, s = logits.size()[:2]
-        weight_mask_expanded = weight_mask.unsqueeze(0).unsqueeze(0).expand(N, s, -1)
-        weighted_probs = log_neg_probs_masked * weight_mask_expanded
-
-        if selective_penalty:
-            indices = torch.argmax(logits, dim=-1)
-            indices_mask = F.one_hot(indices, num_classes=logits.shape[-1])  # (N,s,v)
-            weighted_probs *= indices_mask
-
-            # now determine the number of tokens to which UL is applied
-            count_vec = (weighted_probs != 0).int()  # (N,s,v)
-            count_vec = torch.sum(count_vec, dim=-1)  # (N,s)
-            pad_mask = decoder_input_ids.eq(1).eq(0).int()
-            count_vec *= pad_mask
-
-            # self.num_outputs += pad_mask.sum()
-            # self.num_ul += count_vec.sum()
-
-        # TODO: take into account batch size (doesn't matter now since N=1)
-        ul = -torch.sum(weighted_probs)
-        if ul.isinf().any().item() is True:
-            ul = torch.tensor(0.0)
-        elif ul.isnan().any().item() is True:
-            ul = torch.tensor(0.0)
-        # print(weighted_probs)
-        # z = torch.count_nonzero(weighted_probs)
-        # print(ul)
-        # print(ul.isnan().any())
-        return ul
-
-    def create_logits_processors(self) -> LogitsProcessorList:
-        """Create HF logits processor."""
-        wrapper = LogitsProcessorList()
-        no_repeat_ngram = (
-            self.sample_cfg.no_repeat_ngram_size
-            if self.sample_cfg.no_repeat_ngram_size
-            else None
-        )
-        length_penalty = self.sample_cfg.len_pen if self.sample_cfg.len_pen else None
-        if no_repeat_ngram is not None:
-            wrapper.append(NoRepeatNGramLogitsProcessor(no_repeat_ngram))
-        if length_penalty is not None:
-            wrapper.append(RepetitionPenaltyLogitsProcessor(length_penalty))
-        return wrapper if len(wrapper) > 0 else None
-
-    def create_stopping_criteria(self) -> StoppingCriteriaList:
-        """Create hf stopping criteria."""
-        assert self.sample_cfg.max_len is not None, "Max length must be specified."
-
-        wrapper = StoppingCriteriaList(
-            MaxLengthCriteria(max_length=self.sample_cfg.max_len)
-        )
-        return wrapper
-
-    def create_sampled_logits_wrapper(self) -> LogitsProcessorList:
-        """Create HF sampled logits processors."""
-        top_k = self.sample_cfg.top_k
-        top_p = self.sample_cfg.top_p
-        temprature = self.sample_cfg.temprature
-        wrapper = LogitsProcessorList()
-        if temprature is not None:
-            self.sampled_logits_preprocessor.append(
-                TemperatureLogitsWarper(temperature=temprature)
-            )
-        if top_k is not None:
-            self.sampled_logits_preprocessor.append(TopKLogitsWarper(top_k=top_k))
-        if top_p is not None and top_p < 1.0:
-            self.sampled_logits_preprocessor.append(TopPLogitsWarper(top_p=top_p))
-
-        return wrapper if len(wrapper) > 0 else None
-
-    def _expand_inputs_for_generation(self, num_return_sequences):
-        # Todo implement beam search
-        pass
 
     def _get_encoder_outputs(self, input_ids, attention_mask) -> Dict:
         """Get encoder outputs."""
@@ -270,28 +146,10 @@ class RLTrainer(pl.LightningModule):
             decoder_input_ids=batch["decoder_input_ids"],
             labels=batch["labels"],
         )
-        # print(outputs.loss)
-        if self.ul_config.use_ul is True:
-            if self.are_weights_on_device is False:
-                self.ul_weights = self.ul_weights.type_as(outputs.logits)
-                self.are_weights_on_device = True
-            ul_loss = self.unlikelihood_loss(
-                decoder_input_ids=batch["decoder_input_ids"],
-                weight_mask=self.ul_weights,
-                logits=outputs.logits,
-                selective_penalty=self.ul_config.ul_selective_penalty,
-            )
-            ul_loss = self.ul_config.ul_alpha * ul_loss
-
-        if self.ul_config.use_ul is True:
-            loss = outputs.loss + ul_loss
-            # print(loss)
-            return {"loss": loss, "ul_loss": ul_loss.detach()}
-        else:
-            return {"loss": outputs.loss}
+        return {"loss": outputs.loss}
 
     def rl_step(self, batch):
-
+        """Method for RL-step to calculate rewards."""
         log_probs, sample_ids = self.sample_log_probs(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
@@ -334,8 +192,6 @@ class RLTrainer(pl.LightningModule):
         rl_loss = (greedy_rewards - sample_rewards) * log_probs
         rl_loss = torch.mean(rl_loss)
 
-        # if rl_loss < 0.0:
-        #    rl_loss = torch.tensor(0.0).type_as(log_probs)
 
         return {
             "rl_loss": rl_loss,
@@ -344,6 +200,7 @@ class RLTrainer(pl.LightningModule):
         }
 
     def combine_loss(self, mle_loss, rl_loss=None):
+        """Method to combine losses."""
         if self.model_cfg.use_rl and rl_loss is not None:
             loss = (
                 1 - self.model_cfg.gamma
@@ -367,8 +224,6 @@ class RLTrainer(pl.LightningModule):
                 "sample_rewards": rl_loss["sample_rewards"],
                 "greedy_rewards": rl_loss["greedy_rewards"],
             }
-            if "ul_loss" in list(mle_loss.keys()):
-                loss_dict.update({"ul_loss": mle_loss["ul_loss"]})
             return loss_dict
 
         else:
@@ -433,8 +288,6 @@ class RLTrainer(pl.LightningModule):
                     gen_ids, skip_special_tokens=True, cleanup_tokenization_spaces=True
                 ),
             }
-        else:
-            return {"rouge": rouge}
 
     def validation_step(self, batch, batch_idx):
         """Validation step."""
@@ -520,6 +373,7 @@ class RLTrainer(pl.LightningModule):
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def train_dataloader(self):
+        """Method to create training dataloader."""
         return torch.utils.data.DataLoader(
             self.train_ds["ds"],
             batch_size=self.model_cfg.train_batch_size,
@@ -529,6 +383,7 @@ class RLTrainer(pl.LightningModule):
         )
 
     def val_dataloader(self):
+        """Method to create validation dataloader."""
         val_ds = create_data(
             model=self.model, split="valid", start=self.start, stop=self.stop
         )
@@ -541,6 +396,7 @@ class RLTrainer(pl.LightningModule):
         )
 
     def test_dataloader(self):
+        """Method to create test dataloader"""
         test_ds = create_data(model=self.model, split="test", start=-1, stop=-1)
         return torch.utils.data.DataLoader(
             test_ds["ds"],
