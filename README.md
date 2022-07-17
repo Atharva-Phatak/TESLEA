@@ -1,4 +1,4 @@
-TESLEA : Text Simplification for Reinforcement Learning
+## TESLEA : Text Simplification for Reinforcement Learning
 
 The repo is structured as follows
 
