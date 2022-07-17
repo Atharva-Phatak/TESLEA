@@ -1,13 +1,14 @@
-# TESLEA : Medical Text Simplification using Reinforcement Learning
+TESLEA : Text Simplification for Reinforcement Learning
 
-To run the models use the below command
+The repo is structured as follows
 
-``` python train_scst.py -h```
+- src : Contains all the code files and instructions to run the code
+- data : Contains the training data and Human annotations
 
-To reproduce results run
+Steps to run the code.
 
-```python train_scst.py --epochs 30 -experiment_name <experiment-name> -bs 1 -model_path <path-to-finetuned-bart-model>   -gpus 1 -cpus 6 -no_repeat_ngram 5 -no_copy_ngram 7 -only_rl 1 -use_ul 0 -generate_strat sample_scst -use_deepspeed 0 -fast_run 0 --n_start -1 --n_stop -1```
-
-This will result in cli for which you can add inputs. 
-
-* Model will be released soon huggingface hub.
+- Clone the repo.
+- Setup a virtualenv using python.
+- Install requirements using `pip install -r requirements.txt`
+- Also install [BioSentVec](https://github.com/ncbi-nlp/BioSentVec)
+- cd src and follow the instructions mentioned in src folder.

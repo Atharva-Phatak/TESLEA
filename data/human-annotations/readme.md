@@ -11,3 +11,5 @@ The evaluators rate the text on a Likert scale from 1 to 5. First, simplified te
 The included CSV files contain average likert scores for each rater after scaling, as mentioned each evaluator is shown two subsets hence there are overlaps between valuations which is then scaled.
 
 We hope this data will help to further research. We are also releasing the set of sentences used for this study.
+
+The training data is converted to CSV. Original data can be found [here](https://github.com/AshOlogn/Paragraph-level-Simplification-of-Medical-Texts)
